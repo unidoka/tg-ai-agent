@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  # Сервер Фигмы
+  mcp-server:
+    build: .
+    container_name: figma_mcp_server
+    restart: always
+    environment:
+      - LC_ALL=C
+      - FRAMELINK_HOST=0.0.0.0  # <--- КРИТИЧЕСКИ ВАЖНАЯ СТРОКА ТУТ
+    command: figma-developer-mcp --port ${mcp_server_port} --figmaApiKey ${figma_mcp_key}
+    ports:
+      - "${mcp_server_port}:${mcp_server_port}"
+    env_file:
+      - .env
+
+  # Контейнер-утилита для запуска Aider-скрипта
+  aider-agent:
+    build: .
+    container_name: aider_agent
+    env_file:
+      - .env
+    volumes:
+      - /home/rovno-dev/repos/test/just:/app/workspace
+      - /home/rovno-dev/use_aider:/app/scripts
+    working_dir: /app/workspace
