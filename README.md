@@ -31,3 +31,5 @@ docker compose up -d --build
 ## Работа с ботом
 
 /list для просмотра команд
+
+Для скачивания дизайна с figma используйте скрипт exportSelectedContext.js из репозитория https://github.com/vershiny-top/how-to-generate-figma-design
