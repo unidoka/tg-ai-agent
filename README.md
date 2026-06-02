@@ -22,7 +22,7 @@ cp xray_config.json.example xray_config.json
 Открой файл xray_config.json и в массив "outbounds" вставь конфигурацию своего рабочего прокси (VLESS / Reality / Shadowsocks).
 ```
 
-Запуск aider
+Запуск
 ```
 docker compose up -d --build
 ```

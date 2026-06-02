@@ -1,57 +1,56 @@
 import os
 import asyncio
 
-# Базовый путь, где лежат все проекты (внутри контейнера)
+# Базовый путь
 BASE_WORKSPACE = "/app/workspace"
 
 def find_project_files(project_path, max_depth=5):
-    """Находит файлы в конкретном выбранном проекте"""
+    """Рекурсивный поиск файлов, аналогичный твоему старому скрипту"""
     project_files = []
     excludes = {'.git', 'node_modules', 'venv', '.venv', '__pycache__', '.idea', 'dist', 'build'}
     
     for root, dirs, files in os.walk(project_path):
+        # Исключаем лишнее
         dirs[:] = [d for d in dirs if d not in excludes and not d.startswith('.')]
         
-        # Считаем глубину относительно корня выбранного проекта
+        # Считаем глубину
         relative_root = os.path.relpath(root, project_path)
         if relative_root != '.' and relative_root.count(os.sep) >= max_depth:
             continue
             
         for file in files:
             if not file.startswith('.'):
-                project_files.append(os.path.join(root, file))
+                # Добавляем путь относительно cwd (когда запустим subprocess, это будет просто имя файла)
+                rel_file = os.path.relpath(os.path.join(root, file), project_path)
+                project_files.append(rel_file)
                 
     return project_files
 
 async def run_aider(project_name: str, message_text: str) -> str:
-    """Асинхронный вызов Aider внутри конкретной папки проекта"""
     project_path = os.path.join(BASE_WORKSPACE, project_name)
     
     if not os.path.exists(project_path):
-        return f"❌ Ошибка: Папка проекта '{project_name}' не найдена в воркспейсе!"
+        return f"❌ Ошибка: Папка проекта '{project_name}' не найдена!"
+
+    # Подготовка файлов
+    project_files = find_project_files(project_path)
+    
+    # 🚨 Фикс для пустого репозитория: если файлов нет, Aider не поймет, что делать
+    if not project_files:
+        default_file = os.path.join(project_path, "index.html")
+        with open(default_file, "w", encoding="utf-8") as f:
+            f.write("")
+        project_files = ["index.html"]
 
     env = os.environ.copy()
+    env.pop("HTTP_PROXY", None)
+    env.pop("HTTPS_PROXY", None)
+    env.pop("http_proxy", None)
+    env.pop("https_proxy", None)
     if os.environ.get("OPENAI_API_BASE"):
         env["OPENAI_API_BASE"] = os.environ["OPENAI_API_BASE"]
 
-    project_files = find_project_files(project_path)
-    
-    # 🚨 ЖЕСТКАЯ ИНЪЕКЦИЯ ПРОМПТА ДЛЯ ПОДАВЛЕНИЯ МУСОРА И <think>
-    prompt = message_text + (
-        "\n\n====================\n"
-        "🚨 СИСТЕМНОЕ ПРАВИЛО (КРИТИЧЕСКИ ВАЖНО): 🚨\n"
-        "1. ЗАПРЕЩЕНО использовать теги <think> и писать цепочки рассуждений.\n"
-        "2. ЗАПРЕЩЕНО писать любые вводные фразы (например, 'Let\\'s write the code', 'Here is', 'Ок, сделаю').\n"
-        "3. Твой ответ должен начинаться СТРОГО с имени файла на чистой строке, после чего сразу идет блок кода. "
-        "Если ты напишешь хоть один символ перед именем файла, система упадет!"
-    )
-    
-    figma_name = os.environ.get("FIGMA_STATE_PATH", "figma_state.txt")
-    tasks_name = os.environ.get("TASKS_PATH", "tasks.md")
-    
-    figma_file_path = os.path.join(project_path, figma_name)
-    tasks_file_path = os.path.join(project_path, tasks_name)
-
+    # Формируем команду
     cmd = [
         "aider", 
         "--model", os.environ.get("OPENAI_API_MODEL"),
@@ -61,20 +60,23 @@ async def run_aider(project_name: str, message_text: str) -> str:
         "--no-show-model-warnings",
         "--analytics-disable",
         "--no-stream",
-        "--no-suggest-shell-commands"
+        "--no-suggest-shell-commands",
+        "--message", message_text
     ]
 
-    if os.path.exists(figma_file_path):
-        prompt += f"\n\nУЧИТЫВАЙ КОНТЕКСТ ДИЗАЙНА ИЗ ФАЙЛА: {figma_name}"
-        cmd.extend(["--read", figma_file_path])
-        
-    if os.path.exists(tasks_file_path):
-        prompt += f"\n\nУЧИТЫВАЙ ТЕХНИЧЕСКОЕ ЗАДАНИЕ ИЗ ФАЙЛА: {tasks_name}"
-        cmd.extend(["--read", tasks_file_path])
+    # Добавляем файлы из Figma/Tasks, если есть
+    figma_path = os.path.join(project_path, os.environ.get("FIGMA_STATE_PATH", "figma_state.txt"))
+    tasks_path = os.path.join(project_path, os.environ.get("TASKS_PATH", "tasks.md"))
+    
+    if os.path.exists(figma_path):
+        cmd.extend(["--read", os.path.relpath(figma_path, project_path)])
+    if os.path.exists(tasks_path):
+        cmd.extend(["--read", os.path.relpath(tasks_path, project_path)])
 
-    cmd.extend(["--message", prompt])
+    # Добавляем файлы проекта в конец
     cmd.extend(project_files)
     
+    # Запуск
     process = await asyncio.create_subprocess_exec(
         *cmd,
         env=env,
@@ -88,4 +90,4 @@ async def run_aider(project_name: str, message_text: str) -> str:
     out_str = stdout.decode('utf-8', errors='replace').strip()
     err_str = stderr.decode('utf-8', errors='replace').strip()
     
-    return f"STDOUT:\n{out_str}\n\nSTDERR:\n{err_str}"
+    return f"=== STDOUT ===\n{out_str}\n\n=== STDERR ===\n{err_str}"
