@@ -16,9 +16,18 @@ cp .env.example .env
 nano .env
 ```
 
+Настройка прокси
+```
+cp xray_config.json.example xray_config.json
+Открой файл xray_config.json и в массив "outbounds" вставь конфигурацию своего рабочего прокси (VLESS / Reality / Shadowsocks).
+```
+
 Запуск aider
 ```
-docker compose up -d mcp-server
-cd {ваша_папка_с_проектом}
-docker compose -f {папка_с_репозиторием}/docker-compose.yml run -T --rm aider-agent python3 /app/scripts/test_figma.py "Сверстай секцию, используя tailwind" "ссылка_блока"
+docker compose up -d --build
 ```
+
+
+## Работа с ботом
+
+/list для просмотра команд

@@ -1,0 +1,4 @@
+aider-chat
+python-dotenv
+aiogram
+aiohttp-socks
