@@ -10,6 +10,20 @@ cd ~
 git clone {ссылка_на_репозиторий}
 ```
 
+## Управление правами к репозиторию
+
+Копируем приватные ключи всех репозиториев, в ~/.ssh из github
+
+Настраиваем ssh для подключения по 443 порту к гитхабу
+```
+nano ~/.ssh
+
+Host github.com
+    Hostname ssh.github.com
+    Port 443
+    User git
+```
+
 Пропишите ваши секреты в .env
 ```
 cp .env.example .env
@@ -25,21 +39,6 @@ cp xray_config.json.example xray_config.json
 Запуск
 ```
 docker compose up -d --build
-```
-
-
-## Управление правами к репозиторию
-
-Копируем приватный ключ в ~/.ssh из github
-
-Настраиваем ssh для подключения по 443 порту к гитхабу
-```
-nano ~/.ssh
-
-Host github.com
-    Hostname ssh.github.com
-    Port 443
-    User git
 ```
 
 Проверяем подключение
