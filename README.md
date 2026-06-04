@@ -28,6 +28,28 @@ docker compose up -d --build
 ```
 
 
+## Управление правами к репозиторию
+
+Копируем приватный ключ в ~/.ssh из github
+
+Настраиваем ssh для подключения по 443 порту к гитхабу
+```
+nano ~/.ssh
+
+Host github.com
+    Hostname ssh.github.com
+    Port 443
+    User git
+```
+
+Проверяем подключение
+```
+docker exec -it aider_agent bash
+cd {название_папки_с_репозиторием}
+git fetch origin
+```
+
+
 ## Работа с ботом
 
 /list для просмотра команд

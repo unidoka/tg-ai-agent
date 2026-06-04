@@ -1,62 +1,164 @@
 import os
 import asyncio
+import aiohttp
+import json
+from aiohttp import web
 
-# Базовый путь
+# Базовый путь, где лежат все проекты (внутри контейнера)
 BASE_WORKSPACE = "/app/workspace"
+# Имя ветки, в которой будет изолированно работать Aider
+AIDER_BRANCH = "aider-auto-branch"
 
 def find_project_files(project_path, max_depth=5):
-    """Рекурсивный поиск файлов, аналогичный твоему старому скрипту"""
+    """Рекурсивный поиск файлов. 
+
+    Файлы контекста (figma_state, tasks) в корне добавляются ВСЕГДА.
+    Остальные файлы — только если они меньше 30 КБ и не содержат мусорных тегов.
+    """
     project_files = []
-    excludes = {'.git', 'node_modules', 'venv', '.venv', '__pycache__', '.idea', 'dist', 'build'}
-    
+    excludes = {'.git', 'node_modules', '.next', 'dist', 'build', 'public'}
+    ALWAYS_INCLUDE = {'figma_state.txt', 'tasks.md'}
+
     for root, dirs, files in os.walk(project_path):
-        # Исключаем лишнее
         dirs[:] = [d for d in dirs if d not in excludes and not d.startswith('.')]
         
-        # Считаем глубину
         relative_root = os.path.relpath(root, project_path)
         if relative_root != '.' and relative_root.count(os.sep) >= max_depth:
             continue
             
         for file in files:
-            if not file.startswith('.'):
-                # Добавляем путь относительно cwd (когда запустим subprocess, это будет просто имя файла)
-                rel_file = os.path.relpath(os.path.join(root, file), project_path)
+            if file.startswith('.env'):
+                continue
+                
+            # Игнорируем битые файлы от прошлых косяков модели с <think>
+            if '<' in file or '>' in file or 'think' in file.lower():
+                continue
+                
+            file_full_path = os.path.join(root, file)
+            is_root_file = (relative_root == '.')
+
+            if is_root_file and file in ALWAYS_INCLUDE:
+                rel_file = os.path.relpath(file_full_path, project_path)
                 project_files.append(rel_file)
+                continue
+
+            # Фильтр по размеру (до 30 КБ), чтобы не взорвать лимит Яндекса в 1 МБ
+            try:
+                if os.path.getsize(file_full_path) > 30 * 1024:
+                    continue
+            except OSError:
+                continue
+
+            rel_file = os.path.relpath(file_full_path, project_path)
+            project_files.append(rel_file)
                 
     return project_files
 
+# --- МИДЛВАРЬ-ПРОКСИ ДЛЯ ФИКСА ЯНДЕКСА ---
+async def proxy_handler(request):
+    """Перехватывает запрос от Aider, сует туда reasoning_effort=none и шлет в Яндекс"""
+    target_url = "https://ai.api.cloud.yandex.net/v1/chat/completions"
+    
+    headers = {k: v for k, v in request.headers.items() if k.lower() not in ['host', 'content-length']}
+    body = await request.json()
+    
+    # Отключаем deep think
+    body["reasoning_effort"] = "none"
+    
+    connector = aiohttp.TCPConnector(use_dns_cache=False)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        try:
+            async with session.post(target_url, json=body, headers=headers, timeout=120) as resp:
+                res_bytes = await resp.read()
+                
+                # Защитный пост-фильтр текста от тегов <think>
+                try:
+                    res_json = json.loads(res_bytes.decode('utf-8'))
+                    if "choices" in res_json and len(res_json["choices"]) > 0:
+                        content = res_json["choices"][0]["message"].get("content", "")
+                        if "</think>" in content:
+                            res_json["choices"][0]["message"]["content"] = content.split("</think>")[-1].strip()
+                            res_bytes = json.dumps(res_json).encode('utf-8')
+                except Exception:
+                    pass
+
+                return web.Response(
+                    body=res_bytes, 
+                    status=resp.status, 
+                    headers={k: v for k, v in resp.headers.items() if k.lower() not in ['content-encoding', 'transfer-encoding', 'content-length']}
+                )
+        except Exception as e:
+            return web.Response(text=f"Proxy Error: {str(e)}", status=500)
+
+async def run_git_cmd(args, cwd, env):
+    """Утилита для быстрого и безопасного выполнения git-команд"""
+    proc = await asyncio.create_subprocess_exec(
+        *args, cwd=cwd, env=env,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    stdout, stderr = await proc.communicate()
+    return proc.returncode, stdout.decode('utf-8', errors='replace').strip(), stderr.decode('utf-8', errors='replace').strip()
+
 async def run_aider(project_name: str, message_text: str) -> str:
     project_path = os.path.join(BASE_WORKSPACE, project_name)
+    full_log = []
     
     if not os.path.exists(project_path):
-        return f"❌ Ошибка: Папка проекта '{project_name}' не найдена!"
-
-    # Подготовка файлов
-    project_files = find_project_files(project_path)
-    
-    # 🚨 Фикс для пустого репозитория: если файлов нет, Aider не поймет, что делать
-    if not project_files:
-        default_file = os.path.join(project_path, "index.html")
-        with open(default_file, "w", encoding="utf-8") as f:
-            f.write("")
-        project_files = ["index.html"]
+        return f"❌ Ошибка: Папка проекта '{project_name}' не найдена в воркспейсе!"
 
     env = os.environ.copy()
     env.pop("HTTP_PROXY", None)
     env.pop("HTTPS_PROXY", None)
     env.pop("http_proxy", None)
     env.pop("https_proxy", None)
-    if os.environ.get("OPENAI_API_BASE"):
-        env["OPENAI_API_BASE"] = os.environ["OPENAI_API_BASE"]
+    
+    # Направляем Aider в наш прокси
+    env["OPENAI_API_BASE"] = "http://127.0.0.1:28394"
 
-    # Формируем команду
+    # 1. Настройка гит-окружения
+    await run_git_cmd(["git", "config", "--global", "--add", "safe.directory", project_path], project_path, env)
+    
+    # 2. Логика автоматического создания и переключения на ветку Aider'а
+    full_log.append("=== GIT BRANCHING ===")
+    # Проверяем, существует ли уже наша автоматическая ветка
+    code, out, _ = await run_git_cmd(["git", "branch", "--list", AIDER_BRANCH], project_path, env)
+    
+    if AIDER_BRANCH in out:
+        # Ветка есть, просто переключаемся на неё
+        code, _, err = await run_git_cmd(["git", "checkout", AIDER_BRANCH], project_path, env)
+        full_log.append(f"Переключено на существующую ветку {AIDER_BRANCH}")
+    else:
+        # Ветки нет, создаем новую от текущего места и переключаемся
+        code, _, err = await run_git_cmd(["git", "checkout", "-b", AIDER_BRANCH], project_path, env)
+        if code == 0:
+            full_log.append(f"Создана и выбрана новая ветка: {AIDER_BRANCH}")
+        else:
+            full_log.append(f"⚠️ Ошибка создания ветки (работаем в текущей): {err}")
+
+    # 3. Запуск локального сервера-прокси для Яндекса
+    app = web.Application()
+    app.router.add_post('/chat/completions', proxy_handler)
+    app.router.add_post('/v1/chat/completions', proxy_handler)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '127.0.0.1', 28394)
+    await site.start()
+
+    # Собираем файлы проекта
+    project_files = find_project_files(project_path)
+    if not project_files:
+        default_file = os.path.join(project_path, "index.html")
+        if not os.path.exists(default_file):
+            with open(default_file, "w", encoding="utf-8") as f: f.write("")
+        project_files = ["index.html"]
+
+    # Конфигурация запуска самого Aider
     cmd = [
         "aider", 
         "--model", os.environ.get("OPENAI_API_MODEL"),
         "--edit-format", "whole",
         "--yes-always",
-        "--no-auto-commits",
         "--no-show-model-warnings",
         "--analytics-disable",
         "--no-stream",
@@ -64,30 +166,57 @@ async def run_aider(project_name: str, message_text: str) -> str:
         "--message", message_text
     ]
 
-    # Добавляем файлы из Figma/Tasks, если есть
-    figma_path = os.path.join(project_path, os.environ.get("FIGMA_STATE_PATH", "figma_state.txt"))
-    tasks_path = os.path.join(project_path, os.environ.get("TASKS_PATH", "tasks.md"))
-    
-    if os.path.exists(figma_path):
-        cmd.extend(["--read", os.path.relpath(figma_path, project_path)])
-    if os.path.exists(tasks_path):
-        cmd.extend(["--read", os.path.relpath(tasks_path, project_path)])
+    figma_name = os.environ.get("FIGMA_STATE_PATH", "figma_state.txt")
+    tasks_name = os.environ.get("TASKS_PATH", "tasks.md")
+    figma_file_path = os.path.join(project_path, figma_name)
+    tasks_file_path = os.path.join(project_path, tasks_name)
 
-    # Добавляем файлы проекта в конец
+    if os.path.exists(figma_file_path):
+        cmd.extend(["--read", os.path.relpath(figma_file_path, project_path)])
+    if os.path.exists(tasks_file_path):
+        cmd.extend(["--read", os.path.relpath(tasks_file_path, project_path)])
+
     cmd.extend(project_files)
     
-    # Запуск
+    # 4. Запуск Aider
     process = await asyncio.create_subprocess_exec(
-        *cmd,
-        env=env,
-        cwd=project_path,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
+        *cmd, env=env, cwd=project_path,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
-    
     stdout, stderr = await process.communicate()
+    
+    # Выключаем прокси-сервер
+    await runner.cleanup()
     
     out_str = stdout.decode('utf-8', errors='replace').strip()
     err_str = stderr.decode('utf-8', errors='replace').strip()
     
-    return f"=== STDOUT ===\n{out_str}\n\n=== STDERR ===\n{err_str}"
+    if out_str:
+        full_log.append("\n=== AIDER STDOUT ===")
+        full_log.append(out_str)
+    if err_str and "Input is not a terminal" not in err_str:
+        full_log.append("\n=== AIDER STDERR ===")
+        full_log.append(err_str)
+        
+    # 5. БЛОК АВТОМАТИЧЕСКОГО ПУША НА УДАЛЕННЫЙ РЕПОЗИТОРИЙ
+    if process.returncode == 0:
+        full_log.append("\n=== GIT AUTO PUSH ===")
+        # Пушим именно ветку Aider'а (используем -u, чтобы связать ветки на будущее)
+        push_code, p_out, p_err = await run_git_cmd(
+            ["git", "push", "-u", "origin", AIDER_BRANCH], 
+            project_path, env
+        )
+        
+        if p_out:
+            full_log.append(p_out)
+        if p_err:
+            full_log.append(p_err) # Гит пишет прогресс отправки в stderr, это ок
+            
+        if push_code == 0:
+            full_log.append(f"\n✅ Все коммиты успешно улетели в ветку {AIDER_BRANCH} на удаленный репозиторий!")
+        else:
+            full_log.append(f"\n❌ Ошибка во время выполнения git push. Код ответа: {push_code}")
+    else:
+        full_log.append(f"\n⚠️ Автопуш отменен, так как Aider завершился с ошибкой (код {process.returncode})")
+        
+    return "\n".join(full_log) if full_log else "Aider отработал, логи пусты."

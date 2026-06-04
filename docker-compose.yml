@@ -4,7 +4,6 @@ services:
     container_name: agent_xray_proxy
     restart: unless-stopped
     volumes:
-      # Мапим локальный конфиг юзера внутрь контейнера
       - ./xray_config.json:/etc/xray/config.json
 
   aider-agent:
@@ -17,8 +16,19 @@ services:
       - .env
     environment:
       - PYTHONUNBUFFERED=1
+      - SSH_KEYS=${SSH_KEYS}
+      # Переменную GIT_SSH_COMMAND здесь НЕ задаем глобально, 
+      # так как наш скрипт entrypoint.sh настроит всё локально для каждого репозитория
     volumes:
-      - /home/rovno-dev/repos:/app/workspace # Это юзер поменяет под себя
+      # Папка со всеми твоими репозиториями
+      - /home/rovno-dev/repos:/app/workspace
+      # Папка с кодом самого бота-агента
       - ./:/app/agent
+      # Проброс ключей (скрипт заберет их отсюда, скопирует и настроит права под root внутри контейнера)
+      - ~/.ssh:/root/.ssh:ro
+      # Проброс глобального гитконфига (опционально, но полезно для name/email)
+      - ~/.gitconfig:/root/.gitconfig:ro
     working_dir: /app/workspace
+    # Точка входа, которая выполнит всю грязную работу с правами и SSH перед запуском бота
+    entrypoint: ["/usr/local/bin/entrypoint.sh"]
     command: python3 /app/agent/src/bot.py
