@@ -4,10 +4,35 @@ import aiohttp
 import json
 from aiohttp import web
 
+
+def get_target_branch(repo_name_or_path):
+    """
+    Парсит REPO_KEYS_MAP из .env и возвращает ветку для текущего репозитория.
+    Если репозиторий не найден или маппинг пустой, возвращает 'ai'.
+    """
+    if not repo_name_or_path:
+        return "ai"
+        
+    # Вытаскиваем чистое имя папки (на случай, если передан полный путь)
+    repo_name = os.path.basename(os.path.normpath(repo_name_or_path))
+    
+    repo_keys_map = os.getenv("REPO_KEYS_MAP", "")
+    if not repo_keys_map:
+        return "ai"
+
+    # Проходим по парам folder:key:branch
+    for item in repo_keys_map.split(","):
+        parts = item.split(":")
+        # Проверяем, что это валидная тройка и имя папки совпадает
+        if len(parts) == 3 and parts[0].strip() == repo_name:
+            return parts[2].strip()
+            
+    return "ai"  # Фоллбэк, если репозитория нет в списке
+
+
 # Базовый путь, где лежат все проекты (внутри контейнера)
 BASE_WORKSPACE = "/app/workspace"
-# Имя ветки, в которой будет изолированно работать Aider
-AIDER_BRANCH = "aider-auto-branch"
+
 
 def find_project_files(project_path, max_depth=5):
     """Рекурсивный поиск файлов. 
@@ -16,7 +41,7 @@ def find_project_files(project_path, max_depth=5):
     Остальные файлы — только если они меньше 30 КБ и не содержат мусорных тегов.
     """
     project_files = []
-    excludes = {'.git', 'node_modules', '.next', 'dist', 'build', 'public'}
+    excludes = {'.git', 'node_modules', '.next', 'dist', 'build', 'public', '__pycache__'}
     ALWAYS_INCLUDE = {'figma_state.txt', 'tasks.md'}
 
     for root, dirs, files in os.walk(project_path):
@@ -54,6 +79,7 @@ def find_project_files(project_path, max_depth=5):
                 
     return project_files
 
+
 # --- МИДЛВАРЬ-ПРОКСИ ДЛЯ ФИКСА ЯНДЕКСА ---
 async def proxy_handler(request):
     """Перехватывает запрос от Aider, сует туда reasoning_effort=none и шлет в Яндекс"""
@@ -90,6 +116,7 @@ async def proxy_handler(request):
         except Exception as e:
             return web.Response(text=f"Proxy Error: {str(e)}", status=500)
 
+
 async def run_git_cmd(args, cwd, env):
     """Утилита для быстрого и безопасного выполнения git-команд"""
     proc = await asyncio.create_subprocess_exec(
@@ -99,12 +126,16 @@ async def run_git_cmd(args, cwd, env):
     stdout, stderr = await proc.communicate()
     return proc.returncode, stdout.decode('utf-8', errors='replace').strip(), stderr.decode('utf-8', errors='replace').strip()
 
+
 async def run_aider(project_name: str, message_text: str) -> str:
     project_path = os.path.join(BASE_WORKSPACE, project_name)
     full_log = []
     
     if not os.path.exists(project_path):
         return f"❌ Ошибка: Папка проекта '{project_name}' не найдена в воркспейсе!"
+
+    # === ФИКС 1: Динамически определяем ветку именно для этого проекта ===
+    aider_branch = get_target_branch(project_name)
 
     env = os.environ.copy()
     env.pop("HTTP_PROXY", None)
@@ -120,20 +151,39 @@ async def run_aider(project_name: str, message_text: str) -> str:
     
     # 2. Логика автоматического создания и переключения на ветку Aider'а
     full_log.append("=== GIT BRANCHING ===")
-    # Проверяем, существует ли уже наша автоматическая ветка
-    code, out, _ = await run_git_cmd(["git", "branch", "--list", AIDER_BRANCH], project_path, env)
     
-    if AIDER_BRANCH in out:
-        # Ветка есть, просто переключаемся на неё
-        code, _, err = await run_git_cmd(["git", "checkout", AIDER_BRANCH], project_path, env)
-        full_log.append(f"Переключено на существующую ветку {AIDER_BRANCH}")
-    else:
-        # Ветки нет, создаем новую от текущего места и переключаемся
-        code, _, err = await run_git_cmd(["git", "checkout", "-b", AIDER_BRANCH], project_path, env)
+    # На всякий случай стягиваем свежие ветки с origin, чтобы знать актуальное состояние удаленного репо
+    await run_git_cmd(["git", "fetch", "origin"], project_path, env)
+
+    # Проверяем, существует ли уже локальная ветка
+    code, out, _ = await run_git_cmd(["git", "branch", "--list", aider_branch], project_path, env)
+    
+    if aider_branch in out:
+        # Ветка есть, переключаемся на неё
+        code, _, err = await run_git_cmd(["git", "checkout", aider_branch], project_path, env)
         if code == 0:
-            full_log.append(f"Создана и выбрана новая ветка: {AIDER_BRANCH}")
+            full_log.append(f"Переключено на существующую ветку {aider_branch}")
+            # Пытаемся сделать pull, если ветка уже отслеживается на origin, чтобы избежать конфликтов
+            pull_code, _, _ = await run_git_cmd(["git", "pull", "origin", aider_branch], project_path, env)
+            if pull_code == 0:
+                full_log.append(f"Синхронизировано с origin/{aider_branch}")
         else:
-            full_log.append(f"⚠️ Ошибка создания ветки (работаем в текущей): {err}")
+            full_log.append(f"⚠️ Ошибка перехода на ветку {aider_branch}: {err}")
+    else:
+        # Ветки локально нет. Проверим, может она есть на удаленном сервере (origin/ветка)
+        code_remote, out_remote, _ = await run_git_cmd(["git", "branch", "-r", "--list", f"origin/{aider_branch}"], project_path, env)
+        
+        if f"origin/{aider_branch}" in out_remote:
+            # Создаем локальную ветку, привязанную к удаленной
+            code, _, err = await run_git_cmd(["git", "checkout", "-b", aider_branch, f"origin/{aider_branch}"], project_path, env)
+            full_log.append(f"Создана локальная ветка {aider_branch} на основе удаленной origin/{aider_branch}")
+        else:
+            # Полностью новая ветка от текущего места
+            code, _, err = await run_git_cmd(["git", "checkout", "-b", aider_branch], project_path, env)
+            if code == 0:
+                full_log.append(f"Создана и выбрана новая ветка: {aider_branch}")
+            else:
+                full_log.append(f"⚠️ Ошибка создания ветки (работаем в текущей): {err}")
 
     # 3. Запуск локального сервера-прокси для Яндекса
     app = web.Application()
@@ -163,6 +213,8 @@ async def run_aider(project_name: str, message_text: str) -> str:
         "--analytics-disable",
         "--no-stream",
         "--no-suggest-shell-commands",
+        # Говорим айдеру не создавать свои "aider-auto-branch" ветки, а коммитить в текущую выбранную ветку
+        "--no-auto-commits", 
         "--message", message_text
     ]
 
@@ -198,22 +250,26 @@ async def run_aider(project_name: str, message_text: str) -> str:
         full_log.append("\n=== AIDER STDERR ===")
         full_log.append(err_str)
         
+    # Пытаемся сделать коммит, если у нас стоял флаг `--no-auto-commits`, чтобы собрать все правки Aider'а
+    await run_git_cmd(["git", "add", "."], project_path, env)
+    commit_code, _, _ = await run_git_cmd(["git", "commit", "-m", f"feat(bot): aider auto update - {message_text[:30]}"], project_path, env)
+
     # 5. БЛОК АВТОМАТИЧЕСКОГО ПУША НА УДАЛЕННЫЙ РЕПОЗИТОРИЙ
     if process.returncode == 0:
         full_log.append("\n=== GIT AUTO PUSH ===")
-        # Пушим именно ветку Aider'а (используем -u, чтобы связать ветки на будущее)
+        # Пушим именно динамически вычисленную ветку
         push_code, p_out, p_err = await run_git_cmd(
-            ["git", "push", "-u", "origin", AIDER_BRANCH], 
+            ["git", "push", "-u", "origin", aider_branch], 
             project_path, env
         )
         
         if p_out:
             full_log.append(p_out)
         if p_err:
-            full_log.append(p_err) # Гит пишет прогресс отправки в stderr, это ок
+            full_log.append(p_err)  # Гит пишет прогресс отправки в stderr, это ок
             
         if push_code == 0:
-            full_log.append(f"\n✅ Все коммиты успешно улетели в ветку {AIDER_BRANCH} на удаленный репозиторий!")
+            full_log.append(f"\n✅ Все коммиты успешно улетели в ветку {aider_branch} на удаленный репозиторий!")
         else:
             full_log.append(f"\n❌ Ошибка во время выполнения git push. Код ответа: {push_code}")
     else:

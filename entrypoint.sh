@@ -29,7 +29,7 @@ else
 fi
 
 
-# === ШАГ 2: СКАНИРОВАНИЕ И ПРИВЯЗКА К РЕПОЗИТОРИЯМ ===
+# === ШАГ 2: СКАНИРОВАНИЕ И КОНФИГУРАЦИЯ РЕПОЗИТОРИЕВ ===
 echo "[INFO] Сканирование /app/workspace на наличие Git-репозиториев..."
 cd /app/workspace
 
@@ -41,33 +41,65 @@ for dir in *; do
         # Чиним права папки проекта для root, чтобы Git работал без safe.directory
         chown -R root:root "$dir"
 
-        # Ищем, какой ключ задан для этой папки в REPO_KEYS_MAP
         SELECTED_KEY=""
+        SELECTED_BRANCH=""
         
+        # Парсим REPO_KEYS_MAP (формат: folder:key:branch)
         if [ -n "$REPO_KEYS_MAP" ]; then
-            # Парсим строку вида "folder1:key1,folder2:key2"
             IFS=',' read -r -a MAP_ARRAY <<< "$REPO_KEYS_MAP"
             for pair in "${MAP_ARRAY[@]}"; do
                 pair=$(echo "$pair" | xargs)
-                # Разделяем пару по двоеточию
-                map_folder="${pair%%:*}"
-                map_key="${pair#*:}"
+                
+                # Извлекаем компоненты структуры folder:key:branch
+                map_folder=$(echo "$pair" | cut -d':' -f1)
+                map_key=$(echo "$pair" | cut -d':' -f2)
+                map_branch=$(echo "$pair" | cut -d':' -f3)
                 
                 if [ "$map_folder" == "$dir" ]; then
                     SELECTED_KEY="$map_key"
+                    SELECTED_BRANCH="$map_branch"
                     break
                 fi
             done
         fi
 
-        # Если ключ определен и он физически существует, прописываем его в локальный гит репозитория
+        # Дефолтный фоллбэк для ключа, если папки нет в маппинге
+        if [ -z "$SELECTED_KEY" ] && [ -n "$SSH_KEYS" ]; then
+            SELECTED_KEY=$(echo "$SSH_KEYS" | cut -d',' -f1 | xargs)
+            echo "[INFO] Используем дефолтный ключ для '$dir': $SELECTED_KEY"
+        fi
+
+        # Дефолтный фоллбэк для ветки (если не указана, пусть будет main)
+        if [ -z "$SELECTED_BRANCH" ]; then
+            SELECTED_BRANCH="main"
+        fi
+
+        # 1. Применяем настройки SSH для Git
         if [ -n "$SELECTED_KEY" ] && [ -f "/root/.ssh_local/$SELECTED_KEY" ]; then
             cd "$dir"
             git config --local core.sshCommand "ssh -F /dev/null -i /root/.ssh_local/${SELECTED_KEY} -o Hostname=ssh.github.com -o Port=443 -o StrictHostKeyChecking=accept-new"
+            echo "[SUCCESS] Репозиторий '$dir' успешно привязан к ключу '$SELECTED_KEY' (Порт 443)"
+            
+            # 2. Конфигурируем и переключаем ветку
+            echo "[INFO] Проверка ветки для '$dir'. Целевая ветка: $SELECTED_BRANCH"
+            
+            # Получаем имя текущей активной ветки
+            CURRENT_BRANCH=$(git branch --show-current 2>/dev/null || echo "")
+            
+            if [ "$CURRENT_BRANCH" != "$SELECTED_BRANCH" ]; then
+                echo "[INFO] Текущая ветка '$CURRENT_BRANCH' отличается от целевой '$SELECTED_BRANCH'. Переключаем..."
+                
+                # Пытаемся переключиться на ветку, если она локально существует. 
+                # Если её нет — создаем новую от текущего места.
+                git checkout "$SELECTED_BRANCH" 2>/dev/null || git checkout -b "$SELECTED_BRANCH"
+                echo "[SUCCESS] Ветка переключена на '$(git branch --show-current)'"
+            else
+                echo "[INFO] Репозиторий уже находится на ветке '$SELECTED_BRANCH'"
+            fi
+            
             cd /app/workspace
-            echo "[SUCCESS] Репозиторий '$dir' успешно привязан к ключу '$SELECTED_KEY' на порт 443!"
         else
-            echo "[WARN] Не удалось найти валидный ключ для репозитория '$dir'. Локальный SSH не настроен."
+            echo "[WARN] Не удалось настроить локальный SSH для '$dir' (ключ не найден)."
         fi
     fi
 done
