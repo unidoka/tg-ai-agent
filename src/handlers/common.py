@@ -19,6 +19,8 @@ async def cmd_list(message: Message):
         "🤖 <b>Доступные команды:</b>\n\n"
         "📁 <code>/projects</code> — Показать список проектов на сервере\n"
         "🎯 <code>/select [имя_папки]</code> — Выбрать проект для работы\n"
+        "🔄 <code>/pull [ветка]</code> — Стянуть обновления из git\n"
+        "💎 <code>/pr [ветка]</code> — Создать Pull Request (по дефолту в develop)\n"
         "🚀 <code>/run [промпт]</code> — Поставить задачу Aider в очередь проекта\n"
         "📐 <code>/set-figma-state</code> — Загрузить контекст дизайна (figma_state.txt)\n"
         "🧠 <code>/set-skills</code> — Загрузить спецификацию правил для бота (skills.md)\n\n"
