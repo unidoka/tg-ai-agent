@@ -13,6 +13,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Наглухо отключаем паранойю гит-владения для root внутри контейнера
+RUN git config --global safe.directory "*"
+
 # Копируем и даем права скрипту точки входа
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh

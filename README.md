@@ -24,7 +24,8 @@ Host github.com
     User git
 ```
 
-Пропишите ваши секреты в .env
+Скопируйте пропишите ваши секреты в .env
+
 ```
 cp .env.example .env
 nano .env
@@ -38,19 +39,21 @@ cp xray_config.json.example xray_config.json
 
 Запуск
 ```
-docker compose up -d --build
+docker compose up --build
 ```
 
-Проверяем подключение
+
+Клонируем репозитории
 ```
-docker exec -it aider_agent bash
-cd {название_папки_с_репозиторием}
-git fetch origin
+docker exec -it aider_agent /bin/bash
+
+# убедись, что ssh ключ пробросился в /root/.ssh
+ls -la ~/.ssh
+
+git clone {ссылка_на_проект_через_ssh}
 ```
 
 
 ## Работа с ботом
-
-/list для просмотра команд
 
 Для скачивания дизайна с figma используйте скрипт exportSelectedContext.js из репозитория https://github.com/vershiny-top/how-to-generate-figma-design

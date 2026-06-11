@@ -28,7 +28,96 @@ else:
     bot = Bot(token=TG_TOKEN, default_properties=DefaultBotProperties(parse_mode=ParseMode.HTML))
 
 dp = Dispatcher()
+
+# Хранилище выбранных проектов: {user_id: project_name}
 USER_PROJECTS = {}
+
+# --- ДВИЖОК ОЧЕРЕДЕЙ ЗАДАЧ ---
+# Структура: { project_name: asyncio.Queue }
+PROJECT_QUEUES = {}
+# Максимальное количество задач в очереди для одного проекта
+MAX_QUEUE_SIZE = 5
+
+class AiderTask:
+    """Класс для хранения контекста задачи в очереди"""
+    def __init__(self, message: Message, project_name: str, prompt: str):
+        self.message = message
+        self.project_name = project_name
+        self.prompt = prompt
+
+
+async def aider_queue_worker(project_name: str, queue: asyncio.Queue):
+    """Фоновый воркер, обрабатывающий задачи для конкретного проекта одну за другой"""
+    print(f"⚙️ Воркер для проекта [{project_name}] успешно запущен.")
+    while True:
+        # Ждем появления задачи в очереди
+        task: AiderTask = await queue.get()
+        
+        # Переменные для удобства отправки уведомлений автору таски
+        msg = task.message
+        
+        status_msg = await msg.reply(
+            f"🚀 Задача взята в работу для проекта <code>{html.quote(task.project_name)}</code>!\n"
+            f"⏳ Применяю изменения и создаю коммит...", 
+            parse_mode=ParseMode.HTML
+        )
+        
+        try:
+            # Симулируем тайпинг в чат во время работы
+            await msg.bot.send_chat_action(chat_id=msg.chat.id, action=ChatAction.TYPING)
+            
+            # Запускаем тяжелый процесс Aider
+            result = await run_aider(task.project_name, task.prompt)
+            
+            # Очистка ANSI-последовательностей (цвета терминала)
+            ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+            clean_result = ansi_escape.sub('', result)
+            
+            lines = clean_result.splitlines()
+            summary_lines = []
+            
+            for line in lines:
+                clean_line = line.strip()
+                low_line = clean_line.lower()
+                if "commit" in low_line or "applied edit" in low_line or "created file" in low_line:
+                    if "git config" not in low_line and "git repo" not in low_line:
+                        summary_lines.append(clean_line)
+                    
+            if summary_lines:
+                summary_text = "\n".join(summary_lines[:15])
+            else:
+                summary_text = "Изменения применены (информация о коммитах не перехвачена в stdout)."
+
+            log_filename = f"aider_{task.project_name}_{msg.from_user.id}.log"
+            
+            with open(log_filename, "w", encoding="utf-8") as f:
+                f.write(result)
+                
+            document = FSInputFile(log_filename)
+            await status_msg.delete()
+            
+            await msg.reply_document(
+                document=document,
+                caption=(
+                    f"✅ <b>Проект:</b> <code>{html.quote(task.project_name)}</code>\n\n"
+                    f"<b>Git коммиты и изменения:</b>\n"
+                    f"<pre>{html.quote(summary_text)}</pre>\n\n"
+                    f"<i>Полный лог размышлений сохранен в .log файле.</i>"
+                ),
+                parse_mode=ParseMode.HTML
+            )
+            
+            if os.path.exists(log_filename):
+                os.remove(log_filename)
+                
+        except Exception as e:
+            await msg.reply(f"❌ Ошибка при обработке задачи воркером: {str(e)}")
+        finally:
+            # Сообщаем очереди, что задача полностью обработана
+            queue.task_done()
+
+
+# --- ХЭНДЛЕРЫ БОТА ---
 
 @dp.message(lambda msg: msg.from_user.id not in ALLOWED_USERS)
 async def handle_unauthorized(message: Message):
@@ -41,7 +130,7 @@ async def cmd_list(message: Message):
         "🤖 <b>Доступные команды:</b>\n\n"
         "📁 <code>/projects</code> — Показать список проектов на сервере\n"
         "🎯 <code>/select [имя_папки]</code> — Выбрать проект для работы\n"
-        "🚀 <code>/run [промпт]</code> — Запустить Aider (изменения запишутся на диск)\n"
+        "🚀 <code>/run [промпт]</code> — Поставить задачу Aider в очередь проекта\n"
         "📎 <i>Пришли файл (документ) для загрузки контекста дизайна (figma_state.txt)</i>\n\n"
         f"<b>Текущий активный проект:</b> <code>{html.quote(current_project)}</code>"
     )
@@ -100,57 +189,41 @@ async def cmd_run_aider(message: Message):
         return await message.reply("❌ Напиши промпт.", parse_mode=ParseMode.HTML)
 
     project_name = USER_PROJECTS[user_id]
-    status_msg = await message.reply(f"⏳ [{html.quote(project_name)}] Применяю изменения и создаю коммит...", parse_mode=ParseMode.HTML)
-    await message.bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
-    
-    result = await run_aider(project_name, prompt)
-    
-    # Регулярка для полной очистки ANSI-последовательностей (цвета терминала)
-    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-    clean_result = ansi_escape.sub('', result)
-    
-    lines = clean_result.splitlines()
-    summary_lines = []
-    
-    for line in lines:
-        clean_line = line.strip()
-        low_line = clean_line.lower()
-        
-        # Фильтруем системный спам, забираем только коммиты и изменения файлов
-        if "commit" in low_line or "applied edit" in low_line or "created file" in low_line:
-            if "git config" not in low_line and "git repo" not in low_line:
-                summary_lines.append(clean_line)
-            
-    if summary_lines:
-        summary_text = "\n".join(summary_lines[:15])  # Увеличили буфер строк в сообщении
-    else:
-        summary_text = "Изменения применены (информация о коммитах не перехвачена в stdout)."
 
-    # Расширение изменено на .log
-    log_filename = f"aider_{project_name}_{user_id}.log"
-    
-    try:
-        with open(log_filename, "w", encoding="utf-8") as f:
-            f.write(result)
-            
-        document = FSInputFile(log_filename)
-        await status_msg.delete()
-        
-        await message.reply_document(
-            document=document,
-            caption=(
-                f"✅ <b>Проект:</b> <code>{html.quote(project_name)}</code>\n\n"
-                f"<b>Git коммиты и изменения:</b>\n"
-                f"<pre>{html.quote(summary_text)}</pre>\n\n"
-                f"<i>Полный лог размышлений сохранен в .log файле.</i>"
-            ),
+    # Инициализируем очередь и фоновый воркер для проекта, если они еще не созданы
+    if project_name not in PROJECT_QUEUES:
+        PROJECT_QUEUES[project_name] = asyncio.Queue()
+        # Запускаем асинхронный фоновый воркер для этого конкретного проекта
+        asyncio.create_task(aider_queue_worker(project_name, PROJECT_QUEUES[project_name]))
+
+    project_queue = PROJECT_QUEUES[project_name]
+
+    # Проверяем лимит очереди (до 5 задач)
+    if project_queue.qsize() >= MAX_QUEUE_SIZE:
+        return await message.reply(
+            f"⚠️ Очередь задач для проекта <code>{html.quote(project_name)}</code> переполнена (макс. {MAX_QUEUE_SIZE}).\n"
+            f"Подожди завершения текущих задач.", 
             parse_mode=ParseMode.HTML
         )
-    except Exception as e:
-        await message.reply(f"❌ Ошибка при отправке лога: {str(e)}")
-    finally:
-        if os.path.exists(log_filename):
-            os.remove(log_filename)
+
+    # Создаем объект задачи и пушим его в конец очереди
+    task = AiderTask(message, project_name, prompt)
+    await project_queue.put(task)
+
+    # Высчитываем позицию (текущий размер очереди включая только что добавленную задачу)
+    queue_position = project_queue.qsize()
+
+    if queue_position == 1:
+        await message.reply(
+            f"📥 Задача добавлена. Проект <code>{html.quote(project_name)}</code> свободен, сейчас запустится!", 
+            parse_mode=ParseMode.HTML
+        )
+    else:
+        await message.reply(
+            f"📥 Задача успешно добавлена в очередь проекта <code>{html.quote(project_name)}</code>.\n"
+            f"🔢 Твоя позиция в очереди: <b>{queue_position}</b>", 
+            parse_mode=ParseMode.HTML
+        )
 
 @dp.message()
 async def fallback(message: Message):

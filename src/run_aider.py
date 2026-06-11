@@ -13,36 +13,37 @@ def get_target_branch(repo_name_or_path):
     if not repo_name_or_path:
         return "ai"
         
-    # Вытаскиваем чистое имя папки (на случай, если передан полный путь)
     repo_name = os.path.basename(os.path.normpath(repo_name_or_path))
     
     repo_keys_map = os.getenv("REPO_KEYS_MAP", "")
     if not repo_keys_map:
         return "ai"
 
-    # Проходим по парам folder:key:branch
     for item in repo_keys_map.split(","):
-        parts = item.split(":")
-        # Проверяем, что это валидная тройка и имя папки совпадает
-        if len(parts) == 3 and parts[0].strip() == repo_name:
+        # maxsplit=2 гарантирует, что строка поделится МАКСИМУМ на 3 части.
+        # Всё, что идет после второго двоеточия, гарантированно улетит в ветку целиком.
+        parts = item.split(":", 2)
+        
+        if len(parts) >= 3 and parts[0].strip() == repo_name:
             return parts[2].strip()
             
     return "ai"  # Фоллбэк, если репозитория нет в списке
 
 
-# Базовый путь, где лежат все проекты (внутри контейнера)
+# Базовый путь, где лежат все проекты (внутри изолированного контейнера/волюма)
 BASE_WORKSPACE = "/app/workspace"
 
 
 def find_project_files(project_path, max_depth=5):
     """Рекурсивный поиск файлов. 
 
-    Файлы контекста (figma_state, tasks) в корне добавляются ВСЕГДА.
+    Файлы контекста (figma_state, tasks, LLM_RULES) в корне добавляются ВСЕГДА.
     Остальные файлы — только если они меньше 30 КБ и не содержат мусорных тегов.
     """
     project_files = []
     excludes = {'.git', 'node_modules', '.next', 'dist', 'build', 'public', '__pycache__'}
-    ALWAYS_INCLUDE = {'figma_state.txt', 'tasks.md'}
+    # Добавили LLM_RULES.md, чтобы он обрабатывался как корневой файл контекста
+    ALWAYS_INCLUDE = {'figma_state.txt', 'tasks.md', 'LLM_RULES.md'}
 
     for root, dirs, files in os.walk(project_path):
         dirs[:] = [d for d in dirs if d not in excludes and not d.startswith('.')]
@@ -134,7 +135,7 @@ async def run_aider(project_name: str, message_text: str) -> str:
     if not os.path.exists(project_path):
         return f"❌ Ошибка: Папка проекта '{project_name}' не найдена в воркспейсе!"
 
-    # === ФИКС 1: Динамически определяем ветку именно для этого проекта ===
+    # Динамически определяем целевую ветку для конкретного проекта
     aider_branch = get_target_branch(project_name)
 
     env = os.environ.copy()
@@ -143,7 +144,7 @@ async def run_aider(project_name: str, message_text: str) -> str:
     env.pop("http_proxy", None)
     env.pop("https_proxy", None)
     
-    # Направляем Aider в наш прокси
+    # Направляем Aider в наш локальный прокси
     env["OPENAI_API_BASE"] = "http://127.0.0.1:28394"
 
     # 1. Настройка гит-окружения
@@ -152,7 +153,7 @@ async def run_aider(project_name: str, message_text: str) -> str:
     # 2. Логика автоматического создания и переключения на ветку Aider'а
     full_log.append("=== GIT BRANCHING ===")
     
-    # На всякий случай стягиваем свежие ветки с origin, чтобы знать актуальное состояние удаленного репо
+    # Стягиваем свежие ветки с origin
     await run_git_cmd(["git", "fetch", "origin"], project_path, env)
 
     # Проверяем, существует ли уже локальная ветка
@@ -163,7 +164,7 @@ async def run_aider(project_name: str, message_text: str) -> str:
         code, _, err = await run_git_cmd(["git", "checkout", aider_branch], project_path, env)
         if code == 0:
             full_log.append(f"Переключено на существующую ветку {aider_branch}")
-            # Пытаемся сделать pull, если ветка уже отслеживается на origin, чтобы избежать конфликтов
+            # Синхронизируем состояние локальной ветки с удаленной
             pull_code, _, _ = await run_git_cmd(["git", "pull", "origin", aider_branch], project_path, env)
             if pull_code == 0:
                 full_log.append(f"Синхронизировано с origin/{aider_branch}")
@@ -178,7 +179,7 @@ async def run_aider(project_name: str, message_text: str) -> str:
             code, _, err = await run_git_cmd(["git", "checkout", "-b", aider_branch, f"origin/{aider_branch}"], project_path, env)
             full_log.append(f"Создана локальная ветка {aider_branch} на основе удаленной origin/{aider_branch}")
         else:
-            # Полностью новая ветка от текущего места
+            # Полностью новая локальная ветка от текущего коммита
             code, _, err = await run_git_cmd(["git", "checkout", "-b", aider_branch], project_path, env)
             if code == 0:
                 full_log.append(f"Создана и выбрана новая ветка: {aider_branch}")
@@ -195,7 +196,7 @@ async def run_aider(project_name: str, message_text: str) -> str:
     site = web.TCPSite(runner, '127.0.0.1', 28394)
     await site.start()
 
-    # Собираем файлы проекта
+    # Собираем файлы проекта для передачи на изменение
     project_files = find_project_files(project_path)
     if not project_files:
         default_file = os.path.join(project_path, "index.html")
@@ -203,7 +204,11 @@ async def run_aider(project_name: str, message_text: str) -> str:
             with open(default_file, "w", encoding="utf-8") as f: f.write("")
         project_files = ["index.html"]
 
-    # Конфигурация запуска самого Aider
+    # Исключаем файлы контекста из списка файлов на изменение, чтобы Aider не пытался их переписать
+    context_files = {"figma_state.txt", "tasks.md", "LLM_RULES.md"}
+    project_files = [f for f in project_files if os.path.basename(f) not in context_files]
+
+    # Базовая конфигурация запуска самого Aider
     cmd = [
         "aider", 
         "--model", os.environ.get("OPENAI_API_MODEL"),
@@ -213,21 +218,29 @@ async def run_aider(project_name: str, message_text: str) -> str:
         "--analytics-disable",
         "--no-stream",
         "--no-suggest-shell-commands",
-        # Говорим айдеру не создавать свои "aider-auto-branch" ветки, а коммитить в текущую выбранную ветку
+        # Отключаем автокоммиты самого айдера, коммитить будем вручную в конце
         "--no-auto-commits", 
         "--message", message_text
     ]
 
+    # Настройка путей до файлов контекста в корне проекта
     figma_name = os.environ.get("FIGMA_STATE_PATH", "figma_state.txt")
     tasks_name = os.environ.get("TASKS_PATH", "tasks.md")
+    rules_name = "LLM_RULES.md"
+
     figma_file_path = os.path.join(project_path, figma_name)
     tasks_file_path = os.path.join(project_path, tasks_name)
+    rules_file_path = os.path.join(project_path, rules_name)
 
+    # Прокидываем файлы контекста через флаг --read (только для чтения)
     if os.path.exists(figma_file_path):
         cmd.extend(["--read", os.path.relpath(figma_file_path, project_path)])
     if os.path.exists(tasks_file_path):
         cmd.extend(["--read", os.path.relpath(tasks_file_path, project_path)])
+    if os.path.exists(rules_file_path):
+        cmd.extend(["--read", os.path.relpath(rules_file_path, project_path)])
 
+    # Добавляем отфильтрованный список файлов проекта, которые модель может изменять
     cmd.extend(project_files)
     
     # 4. Запуск Aider
@@ -250,14 +263,17 @@ async def run_aider(project_name: str, message_text: str) -> str:
         full_log.append("\n=== AIDER STDERR ===")
         full_log.append(err_str)
         
-    # Пытаемся сделать коммит, если у нас стоял флаг `--no-auto-commits`, чтобы собрать все правки Aider'а
+    # Собираем все измененные файлы и делаем один красивый коммит
     await run_git_cmd(["git", "add", "."], project_path, env)
-    commit_code, _, _ = await run_git_cmd(["git", "commit", "-m", f"feat(bot): aider auto update - {message_text[:30]}"], project_path, env)
+    commit_code, _, _ = await run_git_cmd(
+        ["git", "commit", "-m", f"feat(bot): aider auto update - {message_text[:30]}"], 
+        project_path, env
+    )
 
     # 5. БЛОК АВТОМАТИЧЕСКОГО ПУША НА УДАЛЕННЫЙ РЕПОЗИТОРИЙ
     if process.returncode == 0:
         full_log.append("\n=== GIT AUTO PUSH ===")
-        # Пушим именно динамически вычисленную ветку
+        # Пушим строго в динамически вычисленную ветку
         push_code, p_out, p_err = await run_git_cmd(
             ["git", "push", "-u", "origin", aider_branch], 
             project_path, env
