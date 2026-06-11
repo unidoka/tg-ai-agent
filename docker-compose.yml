@@ -27,7 +27,7 @@ services:
       - ~/.gitconfig:/root/.gitconfig:ro
     working_dir: /app/workspace
     entrypoint: ["/usr/local/bin/entrypoint.sh"]
-    command: python3 /app/agent/src/bot.py
+    command: python3 /app/agent/src/main.py
 
 # Объявляем именованный волюм. Теперь данные репозиториев не сотрутся при перезапусках
 volumes:
