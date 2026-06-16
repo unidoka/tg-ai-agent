@@ -93,11 +93,12 @@ async def cmd_git_pull(message: Message):
 
 @router.message(F.text.startswith("/pr"))
 async def cmd_git_pr(message: Message):
-    """
-    Creates a Pull Request from the current AI branch to a target branch.
-    Usage: /pr [target_branch] (default: develop)
-    """
     user_id = message.from_user.id
+    gh_token = os.environ.get("GITHUB_TOKEN")
+    
+    if not gh_token:
+        return await message.reply("❌ Ошибка: <code>GITHUB_TOKEN</code> не задан в .env файле.", parse_mode=ParseMode.HTML)
+    
     if user_id not in USER_PROJECTS:
         return await message.reply("❌ Сначала выбери проект.", parse_mode=ParseMode.HTML)
     
@@ -107,31 +108,27 @@ async def cmd_git_pr(message: Message):
     args = message.text.split(maxsplit=1)
     base_branch = args[1].strip() if len(args) > 1 else "develop"
     
-    # Git environment (exclude proxies for git operations)
     env = os.environ.copy()
     for proxy_key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]:
         env.pop(proxy_key, None)
 
-    # 1. Get current branch name
+    # Get metadata
     _, head_branch, _ = await run_git_cmd(["git", "branch", "--show-current"], project_path, env)
-    
-    # 2. Get remote origin URL to parse owner/repo
     _, remote_url, _ = await run_git_cmd(["git", "remote", "get-url", "origin"], project_path, env)
     
-    # Parse github owner/repo from SSH or HTTPS URL
     match = re.search(r"github\.com[:/](.+?)/(.+?)(\.git)?$", remote_url)
     if not match:
-        return await message.reply("❌ Не удалось определить репозиторий GitHub из origin URL.")
+        return await message.reply("❌ Не удалось определить репозиторий GitHub.")
     
     owner, repo = match.group(1), match.group(2)
-    gh_token = os.environ.get("GITHUB_TOKEN") or os.environ.get("OPENAI_API_KEY") # Attempting to reuse key if it's a proxy token or needs explicit GH_TOKEN
+    status_msg = await message.reply(f"🚀 Подготовка PR: <code>{head_branch}</code> → <code>{base_branch}</code>...", parse_mode=ParseMode.HTML)
 
-    status_msg = await message.reply(f"🚀 Создаю PR: <code>{head_branch}</code> → <code>{base_branch}</code>...", parse_mode=ParseMode.HTML)
+    # Sync state before PR
+    push_code, _, push_err = await run_git_cmd(["git", "push", "origin", head_branch], project_path, env)
+    if push_code != 0:
+        return await status_msg.edit_text(f"❌ Ошибка при пуше ветки:\n<code>{html.quote(push_err)}</code>")
 
-    # 3. Ensure branch is pushed
-    await run_git_cmd(["git", "push", "origin", head_branch], project_path, env)
-
-    # 4. Create PR via GitHub API
+    # GitHub API Call
     api_url = f"https://api.github.com/repos/{owner}/{repo}/pulls"
     headers = {
         "Authorization": f"token {gh_token}",
@@ -150,14 +147,12 @@ async def cmd_git_pr(message: Message):
             if resp.status == 201:
                 pr_url = res_json.get("html_url")
                 await status_msg.edit_text(
-                    f"✅ <b>Pull Request успешно создан!</b>\n\n"
+                    f"✅ <b>Pull Request создан!</b>\n\n"
                     f"🔗 <a href='{pr_url}'>Просмотреть PR #{res_json.get('number')}</a>",
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=False
+                    parse_mode=ParseMode.HTML
                 )
+            elif resp.status == 422 and "already exists" in str(res_json):
+                await status_msg.edit_text(f"ℹ️ Pull Request для ветки <code>{head_branch}</code> уже существует.")
             else:
-                error_detail = res_json.get('message', 'Unknown error')
-                if "already exists" in error_detail.lower():
-                    await status_msg.edit_text("ℹ️ Pull Request уже существует для этой ветки.")
-                else:
-                    await status_msg.edit_text(f"❌ Ошибка API GitHub ({resp.status}):\n<code>{html.quote(error_detail)}</code>")
+                error_msg = res_json.get('message', 'Unknown error')
+                await status_msg.edit_text(f"❌ GitHub API Error ({resp.status}):\n<code>{html.quote(error_msg)}</code>")

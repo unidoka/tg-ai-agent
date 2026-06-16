@@ -18,11 +18,8 @@ services:
       - PYTHONUNBUFFERED=1
       - SSH_KEYS=${SSH_KEYS}
     volumes:
-      # Изолированный волюм докера для всех репозиториев (внутри он будет полностью под root)
       - projects_data:/app/workspace
-      # Папка с кодом самого бота-агента (оставляем хост-маунт, чтобы ты мог править код бота на хосте)
       - ./:/app/agent
-      # Проброс ключей и гитконфига
       - ~/.ssh:/root/.ssh:ro
       - ~/.gitconfig:/root/.gitconfig:ro
     working_dir: /app/workspace

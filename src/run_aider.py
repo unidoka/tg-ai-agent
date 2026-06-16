@@ -78,7 +78,8 @@ async def run_aider(project_name: str, message_text: str) -> str:
         "--no-stream",
         "--no-suggest-shell-commands",
         "--no-auto-commits", 
-        "--message", message_text
+        "--message", message_text,
+        "--restore-chat-history", "false"
     ]
 
     for ctx_file in ["FIGMA_STATE_PATH", "TASKS_PATH", "LLM_RULES.md"]:
